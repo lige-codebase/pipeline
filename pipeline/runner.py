@@ -28,10 +28,11 @@ def run_pipeline(
 
     流程: fetch → quality check → match → export → report
 
-    断点恢复策略:
-    - fetch 阶段: checkpoint 记录已获取的最后页码/CSV行号，重启从断点继续
-    - quality 阶段: 对所有未经匹配的记录运行检查（幂等操作）
-    - match 阶段: 只对 "通过质量检查 且 尚未匹配" 的记录执行匹配
+    断点恢复策略（每个阶段都会执行，各自内部实现增量/幂等）:
+    - fetch 阶段: checkpoint 记录已获取的最后页码/CSV行号，重启从断点继续加载
+    - quality 阶段: 幂等操作，对所有未匹配的记录重跑无副作用
+    - match 阶段: 通过 get_unmatched_passed_ids() 自动排除已匹配 ID，
+                  match_stage checkpoint 记录子阶段（exact/fuzzy），从断点继续
 
     Args:
         max_pages: API 模式下本轮最多获取的页数 (每页 25 条)
@@ -55,23 +56,12 @@ def run_pipeline(
         "unmatched": 0,
     }
 
-    # ── 断点恢复：检测上次 pipeline 中断在哪个阶段 ──
-    with get_connection() as conn:
-        pipeline_stage = get_checkpoint(conn, "pipeline_stage")
-
-    # 阶段顺序: fetch → quality → match → export → done
-    # 如果上次中断在 match 阶段，重启后跳过已完成的 fetch/quality
-    resume_from = pipeline_stage if pipeline_stage and pipeline_stage != "done" else None
-    if resume_from:
-        logger.info("Resuming pipeline from stage: %s", resume_from)
-
     # ── Stage 1: Fetch ──
+    # fetch 内部通过 checkpoint 实现增量加载（记录页码/CSV行号），
+    # 重启后自动从断点继续获取，因此无需在 runner 层跳过。
     fetched_ids = []
-    if skip_fetch or resume_from in ("quality", "match", "export"):
-        if resume_from:
-            logger.info("── Stage 1: Fetch (skipped, resuming from %s) ──", resume_from)
-        else:
-            logger.info("── Stage 1: Fetch (skipped) ──")
+    if skip_fetch:
+        logger.info("── Stage 1: Fetch (skipped) ──")
     else:
         logger.info("── Stage 1: Fetch (%s mode) ──", source)
         with get_connection() as conn:
@@ -87,33 +77,26 @@ def run_pipeline(
         logger.info("Fetched %d items this round.", len(fetched_ids))
 
     # ── Stage 2: Quality Check ──
-    if resume_from in ("match", "export"):
-        logger.info("── Stage 2: Quality Check (skipped, resuming from %s) ──", resume_from)
-        passed_ids = []
-    else:
-        logger.info("── Stage 2: Quality Check ──")
-        with get_connection() as conn:
-            set_checkpoint(conn, "pipeline_stage", "quality")
-        # 对本轮新获取的 + 之前获取但未匹配的都做质量检查
-        with get_connection() as conn:
-            unmatched = get_unmatched_passed_ids(conn)
-        all_ids_to_check = list(set(fetched_ids + unmatched))
+    # quality check 是幂等操作，对所有未匹配的记录重跑不会产生副作用。
+    logger.info("── Stage 2: Quality Check ──")
+    with get_connection() as conn:
+        set_checkpoint(conn, "pipeline_stage", "quality")
+    with get_connection() as conn:
+        unmatched = get_unmatched_passed_ids(conn)
+    all_ids_to_check = list(set(fetched_ids + unmatched))
 
-        if all_ids_to_check:
-            qc_result = run_quality_checks(all_ids_to_check)
-            round_stats["quality_passed"] = len(qc_result["passed"])
-            round_stats["quality_failed"] = len(qc_result["failed"])
-            passed_ids = qc_result["passed"]
-        else:
-            logger.info("No new items to quality check.")
-            passed_ids = []
+    if all_ids_to_check:
+        qc_result = run_quality_checks(all_ids_to_check)
+        round_stats["quality_passed"] = len(qc_result["passed"])
+        round_stats["quality_failed"] = len(qc_result["failed"])
+    else:
+        logger.info("No new items to quality check.")
 
     # ── Stage 3: Match ──
-    if skip_match or resume_from == "export":
-        if resume_from == "export":
-            logger.info("── Stage 3: Matching (skipped, resuming from export) ──")
-        else:
-            logger.info("── Stage 3: Matching (skipped) ──")
+    # match 内部通过 get_unmatched_passed_ids() 自动排除已匹配的 ID，
+    # match_stage checkpoint 记录子阶段（exact/fuzzy），重启后从断点继续。
+    if skip_match:
+        logger.info("── Stage 3: Matching (skipped) ──")
     else:
         logger.info("── Stage 3: Cross-source Matching ──")
         with get_connection() as conn:
